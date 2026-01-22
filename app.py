@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timedelta
 import pandas as pd
 import io
+import gc  # Importante para limpar memória em arquivos grandes
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Auditor DP Online", layout="wide", page_icon="🕵️")
@@ -16,7 +17,6 @@ st.markdown("""
     .card { border: 1px solid #ddd; padding: 15px; border-radius: 10px; background: white; margin-bottom: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); }
     .status-ok { color: green; font-weight: bold; }
     .status-warning { color: orange; font-weight: bold; }
-    /* Ajuste para a lista de seleção parecer um menu lateral limpo */
     .stRadio > div { overflow-y: auto; max-height: 400px; }
     </style>
 """, unsafe_allow_html=True)
@@ -32,7 +32,7 @@ def login():
         usuario = st.text_input("Usuário")
         senha = st.text_input("Senha", type="password")
         if st.button("Entrar", type="primary"):
-            if usuario == "admindp" and senha == "123456":
+            if usuario == "admin_dp" and senha == "fms_ponto_2024":
                 st.session_state.logado = True
                 st.rerun()
             else:
@@ -42,7 +42,7 @@ if not st.session_state.logado:
     login()
     st.stop()
 
-# --- MOTOR DE CÁLCULO (MANTIDO INTACTO) ---
+# --- MOTOR DE CÁLCULO ---
 def analisar_linha(data_raw, batidas_raw, motivo_raw, escala_str):
     d_str = str(data_raw).strip()
     if not re.match(r"^\d{2}", d_str): return None
@@ -89,20 +89,59 @@ def analisar_linha(data_raw, batidas_raw, motivo_raw, escala_str):
 
     return {"data": d_str, "batidas": bats, "alertas": alertas, "motivo": motivo}
 
-# --- FUNÇÃO GERADORA DE RELATÓRIO EXCEL ---
+# --- FUNÇÃO DE PROCESSAMENTO COM CACHE E LIMPEZA DE MEMÓRIA ---
+@st.cache_data(show_spinner=False, ttl=3600)
+def processar_pdfs(files_bytes, file_names):
+    """
+    Recebe os bytes dos arquivos para permitir o cache do Streamlit.
+    """
+    dados_processados = {}
+    
+    # Criamos um iterador para a barra de progresso fora daqui
+    for idx, (f_bytes, f_name) in enumerate(zip(files_bytes, file_names)):
+        try:
+            # Abre o PDF a partir da memória (BytesIO)
+            with pdfplumber.open(io.BytesIO(f_bytes)) as pdf:
+                last_h = None
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if not text: continue
+                    
+                    def find(label):
+                        m = re.search(rf"{label}:?\s*(.*?)(?=\s*\||\s*Matrícula:|\s*CPF:|\s*Escala:|\s*Cargo:|\s*Período:|\s*$|\n)", text, re.I)
+                        return m.group(1).strip() if m else "N/A"
+                    
+                    nome = find("Colaborador").split("Matrícula")[0].strip()
+                    if nome == "N/A" and last_h: h = last_h
+                    else:
+                        h = {"nome": nome, "mat": find("Matrícula"), "cpf": find("CPF"), "escala": find("Escala"), "per": find("Período")}
+                        last_h = h
+                    
+                    table = page.extract_table()
+                    if table:
+                        for r in table:
+                            if len(r) >= 3:
+                                res = analisar_linha(r[0], r[1], r[2], h['escala'])
+                                if res:
+                                    if h['nome'] not in dados_processados: 
+                                        dados_processados[h['nome']] = {"h": h, "j": []}
+                                    dados_processados[h['nome']]["j"].append(res)
+        except Exception as e:
+            # Retorna o erro para exibir sem quebrar tudo
+            print(f"Erro ao processar {f_name}: {e}")
+            continue
+        
+        # OTIMIZAÇÃO: Força limpeza de memória após cada arquivo grande
+        gc.collect()
+        
+    return dados_processados
+
 def gerar_excel(dados_completos, apenas_erros=False, filtro_nomes=None):
     linhas_relatorio = []
-    
     for nome, info in dados_completos.items():
-        # Se houver filtro de nomes, pula quem não está na lista
-        if filtro_nomes and nome not in filtro_nomes:
-            continue
-            
+        if filtro_nomes and nome not in filtro_nomes: continue
         for dia in info['j']:
-            # Se for "Apenas Erros", pula dias sem alerta
-            if apenas_erros and not dia['alertas']:
-                continue
-                
+            if apenas_erros and not dia['alertas']: continue
             linhas_relatorio.append({
                 "Colaborador": nome,
                 "Matrícula": info['h']['mat'],
@@ -110,142 +149,111 @@ def gerar_excel(dados_completos, apenas_erros=False, filtro_nomes=None):
                 "Data": dia['data'],
                 "Batidas": " | ".join(dia['batidas']),
                 "Motivo Original": dia['motivo'],
-                "Status/Inconsistência": " ; ".join(dia['alertas']) if dia['alertas'] else "OK"
+                "Status": " ; ".join(dia['alertas']) if dia['alertas'] else "OK"
             })
             
-    if not linhas_relatorio:
-        return None
-        
+    if not linhas_relatorio: return None
     df = pd.DataFrame(linhas_relatorio)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Auditoria')
-        # Ajuste automático de colunas (opcional, visual)
         worksheet = writer.sheets['Auditoria']
         for i, col in enumerate(df.columns):
             width = max(df[col].astype(str).map(len).max(), len(col)) + 2
             worksheet.set_column(i, i, width)
-            
     return output.getvalue()
 
-# --- INTERFACE DO DASHBOARD ---
+# --- INTERFACE ---
 st.sidebar.title("📂 Importação")
-uploaded_files = st.sidebar.file_uploader("Arraste os PDFs aqui", accept_multiple_files=True, type="pdf")
+uploaded_files = st.sidebar.file_uploader(
+    "Arraste PDFs (Suporta arquivos grandes)", 
+    accept_multiple_files=True, 
+    type="pdf"
+)
+
+todos_dados = {}
 
 if uploaded_files:
-    todos_dados = {}
+    # Preparação para o processamento (Extrai bytes para permitir cache)
+    files_bytes = [f.getvalue() for f in uploaded_files]
+    files_names = [f.name for f in uploaded_files]
     
-    # Processamento (Mantido)
-    for file in uploaded_files:
-        with pdfplumber.open(file) as pdf:
-            last_h = None
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text: continue
-                def find(label):
-                    m = re.search(rf"{label}:?\s*(.*?)(?=\s*\||\s*Matrícula:|\s*CPF:|\s*Escala:|\s*Cargo:|\s*Período:|\s*$|\n)", text, re.I)
-                    return m.group(1).strip() if m else "N/A"
-                nome = find("Colaborador").split("Matrícula")[0].strip()
-                if nome == "N/A" and last_h: h = last_h
-                else:
-                    h = {"nome": nome, "mat": find("Matrícula"), "cpf": find("CPF"), "escala": find("Escala"), "per": find("Período")}
-                    last_h = h
-                table = page.extract_table()
-                if table:
-                    for r in table:
-                        if len(r) >= 3:
-                            res = analisar_linha(r[0], r[1], r[2], h['escala'])
-                            if res:
-                                if h['nome'] not in todos_dados: todos_dados[h['nome']] = {"h": h, "j": []}
-                                todos_dados[h['nome']]["j"].append(res)
+    with st.spinner(f"Processando {len(uploaded_files)} arquivos... Isso pode levar alguns instantes."):
+        # Chama a função otimizada com cache
+        todos_dados = processar_pdfs(files_bytes, files_names)
 
-    # --- NOVO SISTEMA DE NAVEGAÇÃO LATERAL ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("🔍 Colaboradores")
-    
-    # 1. Busca
-    termo_busca = st.sidebar.text_input("Buscar nome...", "").upper()
-    
-    # 2. Filtragem da lista
-    lista_nomes = sorted(list(todos_dados.keys()))
-    nomes_filtrados = [n for n in lista_nomes if termo_busca in n.upper()]
-    
-    if not nomes_filtrados:
-        st.sidebar.warning("Nenhum colaborador encontrado.")
-        selecionado = None
+    if not todos_dados:
+        st.error("Não foi possível extrair dados. Verifique se o PDF contém texto selecionável.")
     else:
-        # 3. Lista estilo Radio (substitui o selectbox)
-        st.sidebar.caption(f"Mostrando {len(nomes_filtrados)} de {len(lista_nomes)}")
-        selecionado = st.sidebar.radio("Selecione na lista:", nomes_filtrados)
-
-    # --- ÁREA DE RELATÓRIOS ---
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("📄 Gerar Relatórios (Excel)"):
-        apenas_inconsistencias = st.checkbox("Apenas inconsistências", value=True)
-        filtrar_selecionado = st.checkbox("Apenas colaborador atual", value=False)
+        st.sidebar.success(f"Processado com sucesso!")
         
-        if st.button("Baixar Relatório"):
-            filtro_nomes = [selecionado] if filtrar_selecionado and selecionado else None
-            
-            excel_data = gerar_excel(todos_dados, apenas_inconsistencias, filtro_nomes)
-            
-            if excel_data:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-                st.download_button(
-                    label="📥 Clique para Salvar (XLSX)",
-                    data=excel_data,
-                    file_name=f"Auditoria_Ponto_{timestamp}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.warning("Nenhum dado encontrado com os filtros atuais.")
-
-    # --- VISUALIZAÇÃO PRINCIPAL (MANTIDA) ---
-    if selecionado:
-        user = todos_dados[selecionado]
+        # --- NAVEGAÇÃO ---
+        st.sidebar.markdown("---")
+        st.sidebar.header("🔍 Colaboradores")
+        termo_busca = st.sidebar.text_input("Buscar nome...", "").upper()
         
-        # Cabeçalho
-        with st.container():
-            c1, c2 = st.columns([0.5, 4])
-            with c1: st.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=80)
-            with c2: 
-                st.title(f"{selecionado}")
-                st.markdown(f"**Matrícula:** {user['h']['mat']} | **Escala:** {user['h']['escala']} | **Período:** {user['h']['per']}")
+        lista_nomes = sorted(list(todos_dados.keys()))
+        nomes_filtrados = [n for n in lista_nomes if termo_busca in n.upper()]
+        
+        if not nomes_filtrados:
+            st.sidebar.warning("Nenhum encontrado.")
+            selecionado = None
+        else:
+            st.sidebar.caption(f"{len(nomes_filtrados)} encontrados")
+            selecionado = st.sidebar.radio("Selecione:", nomes_filtrados)
 
-        st.divider()
-        ver_apenas_erros = st.checkbox("Ver apenas dias com ocorrências na tela", value=False)
-
-        cols = st.columns(3)
-        count = 0
-        for dia in user['j']:
-            tem_alerta = len(dia['alertas']) > 0
-            if ver_apenas_erros and not tem_alerta: continue
-
-            with cols[count % 3]:
-                border = "red" if tem_alerta else "#ddd"
-                batidas_html = ' | '.join(dia['batidas']) if dia['batidas'] else '<span style="color:#ccc">Sem registro</span>'
-                
-                if dia['alertas']:
-                    status_html = f"<div class='blink'>{'<br>'.join(dia['alertas'])}</div>"
-                elif dia['motivo']:
-                    status_html = f"<div class='status-ok'>✅ {dia['motivo']}</div>"
+        # --- RELATÓRIOS ---
+        st.sidebar.markdown("---")
+        with st.sidebar.expander("📄 Relatórios (Excel)"):
+            apenas_inc = st.checkbox("Apenas inconsistências", value=True)
+            filtro_sel = st.checkbox("Apenas atual", value=False)
+            if st.button("Baixar XLSX"):
+                f_nomes = [selecionado] if filtro_sel and selecionado else None
+                data_xls = gerar_excel(todos_dados, apenas_inc, f_nomes)
+                if data_xls:
+                    ts = datetime.now().strftime("%d%m_%H%M")
+                    st.download_button("📥 Download", data_xls, f"Auditoria_{ts}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 else:
-                    status_html = "<div class='status-ok'>Regular</div>"
-                
-                if dia['alertas'] and dia['motivo']:
-                     status_html += f"<br><small style='color:grey'>{dia['motivo']}</small>"
+                    st.warning("Sem dados para gerar.")
 
-                st.markdown(f"""
-                <div class="card" style="border-left: 5px solid {border};">
-                    <b>📅 {dia['data']}</b><hr style="margin:5px 0">
-                    <div style="font-family:monospace; font-size:1.1em">{batidas_html}</div>
-                    <div style="margin-top:8px; font-size:0.9em">{status_html}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                count += 1
-        
-        if count == 0: st.info("Nenhuma ocorrência encontrada para este filtro visual.")
+        # --- VISUALIZAÇÃO ---
+        if selecionado:
+            user = todos_dados[selecionado]
+            with st.container():
+                c1, c2 = st.columns([0.5, 4])
+                with c1: st.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=80)
+                with c2: 
+                    st.title(f"{selecionado}")
+                    st.markdown(f"**Matrícula:** {user['h']['mat']} | **Escala:** {user['h']['escala']}")
 
+            st.divider()
+            ver_erros = st.checkbox("Focar apenas nas ocorrências", value=False)
+            cols = st.columns(3)
+            count = 0
+            
+            for dia in user['j']:
+                tem_alerta = len(dia['alertas']) > 0
+                if ver_erros and not tem_alerta: continue
+
+                with cols[count % 3]:
+                    border = "red" if tem_alerta else "#ddd"
+                    batidas = ' | '.join(dia['batidas']) if dia['batidas'] else '<span style="color:#ccc">---</span>'
+                    
+                    status = ""
+                    if dia['alertas']: status = f"<div class='blink'>{'<br>'.join(dia['alertas'])}</div>"
+                    elif dia['motivo']: status = f"<div class='status-ok'>✅ {dia['motivo']}</div>"
+                    else: status = "<div class='status-ok'>Regular</div>"
+                    
+                    if dia['alertas'] and dia['motivo']: status += f"<br><small>{dia['motivo']}</small>"
+
+                    st.markdown(f"""
+                    <div class="card" style="border-left: 5px solid {border};">
+                        <b>{dia['data']}</b><hr style="margin:5px 0">
+                        <div style="font-family:monospace;">{batidas}</div>
+                        <div style="margin-top:5px;font-size:0.9em">{status}</div>
+                    </div>""", unsafe_allow_html=True)
+                    count += 1
+            if count == 0: st.info("Nada a exibir com este filtro.")
 else:
     st.title("📊 Auditoria de Ponto Online")
-    st.markdown("### Bem-vindo! Carregue os PDFs no menu lateral para começar.")
+    st.info("Faça upload dos PDFs na barra lateral.")
