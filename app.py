@@ -32,7 +32,7 @@ def login():
         usuario = st.text_input("Usuário")
         senha = st.text_input("Senha", type="password")
         if st.button("Entrar", type="primary"):
-            if usuario == "admin_dp" and senha == "fms_ponto_2024":
+            if usuario == "admindp" and senha == "123456":
                 st.session_state.logado = True
                 st.rerun()
             else:
